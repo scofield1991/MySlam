@@ -1,7 +1,3 @@
-
-#include <iostream>
-#include <stdio.h>
-#include <vector>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/features2d.hpp>
@@ -10,10 +6,25 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/ximgproc/disparity_filter.hpp>
 #include <opencv2/calib3d.hpp>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+#include "g2o/core/base_vertex.h"
+#include "g2o/core/base_unary_edge.h"
+#include <g2o/core/block_solver.h>
+#include <g2o/core/optimization_algorithm_levenberg.h>
+#include <g2o/solvers/csparse/linear_solver_csparse.h>
+#include <g2o/types/sba/types_six_dof_expmap.h>
+
+
 #include <string>
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <iostream>
+#include <stdio.h>
+#include <vector>
+#include <chrono>
 
 #include "PnPProblem.h"
 #include "Utils.h"
@@ -24,6 +35,7 @@ using namespace std;
 struct ImagePose
 {
 	cv::Mat imgLeft;
+	cv::Mat deptMap;
 	cv::Mat descriptorsLeft, descriptorsRight;
 	std::vector<cv::KeyPoint> keyPointsLeft, keyPointsRight;
 	std::vector<cv::DMatch> matchesLeftRight;
@@ -118,6 +130,12 @@ void setPose(cv::Mat T, ImagePose &ip);
 void updatePoseMatrices(ImagePose &ip);
 void UnprojectStereo(ImagePose &cur, std::vector<cv::Point2f> &pointsLeft, std::vector<cv::Point2f> &pointsRight,
 		                cv::Mat &filteredDisp, CameraParams &camPms);
+void bundleAdjustment (const std::vector< cv::Point3f > points_3d, const std::vector< cv::Point2f > points_2d,
+	                   const cv::Mat& K, cv::Mat& R, cv::Mat& t);
+cv::Mat toCvMat(const Eigen::Matrix<double,4,4> &m);
+void find_feature_matches ( const cv::Mat& img_1, const cv::Mat& img_2, std::vector<cv::KeyPoint>& keypoints_1,
+                            std::vector<cv::KeyPoint>& keypoints_2, std::vector<cv::DMatch>& matches );
+cv::Point2d pixel2cam ( const cv::Point2d& p, const cv::Mat& K );
 
 
 
@@ -243,11 +261,51 @@ int main(int argc, char** argv) {
 		MatchKeyPoints(cur.descriptorsLeft, cur.descriptorsRight, cur.matchesLeftRight);
 
 		ComputeDepthMap(imLeft, imRight, filteredDisp, filteredDispVis);
+		filteredDisp.copyTo(cur.deptMap);
 
 		if(i > 0)
 		{
 			ImagePose &prev = imgPoses[i-1];
 			std::cout << "imgPoses[i-1].T:  " << imgPoses[i-1].T << "\n";
+
+			cv::Mat imLeftPrev = cv::imread(imgsLeft[i-1], CV_LOAD_IMAGE_UNCHANGED);
+			std::vector<cv::KeyPoint> keypoints_1, keypoints_2;
+    	    std::vector<cv::DMatch> matchesNew;
+    	    find_feature_matches ( imLeftPrev, imLeft, keypoints_1, keypoints_2, matchesNew );
+    		std::cout<<"matchesNew.size: "<< matchesNew.size() << std::endl;
+
+    		std::vector<cv::Point3f> pts_3d;
+    		std::vector<cv::Point2f> pts_2d;
+    		for ( cv::DMatch m:matchesNew )
+    		{
+        		//ushort d = d1.ptr<unsigned short> (int ( keypoints_1[m.queryIdx].pt.y )) [ int ( keypoints_1[m.queryIdx].pt.x ) ];
+        		ushort d = prev.deptMap.ptr<unsigned short> (int ( keypoints_1[m.queryIdx].pt.y )) [ int ( keypoints_1[m.queryIdx].pt.x ) ];
+        		if ( d == 0 )   // bad depth
+        		{
+        			std::cout << "d = 0 \n";
+            		continue;
+        		}
+        		float dd = d/16.0;
+        		cv::Point2d p1 = pixel2cam ( keypoints_1[m.queryIdx].pt, intrinsicParams );
+        		pts_3d.push_back ( cv::Point3f ( p1.x*dd, p1.y*dd, dd ) );
+        		pts_2d.push_back ( keypoints_2[m.trainIdx].pt );
+    		}
+
+    		    cout<<"3d-2d pairs: "<<pts_3d.size() <<endl;
+
+    			//Mat r, t;
+    			//solvePnP ( pts_3d, pts_2d, K, Mat(), r, t, false ); // 调用OpenCV 的 PnP 求解，可选择EPNP，DLS等方法
+    			//Mat R;
+    			//cv::Rodrigues ( r, R ); // r为旋转向量形式，用Rodrigues公式转换为矩阵
+
+    			//cout<<"R="<<endl<<R<<endl;
+    			//cout<<"t="<<endl<<t<<endl;
+
+   			    //cout<<"calling bundle adjustment"<<endl;
+
+    			//bundleAdjustment ( pts_3d, pts_2d, K, R, t );
+
+
 
 			MatchKeyPoints(prev.descriptorsLeftMatched, cur.descriptorsLeft, cur.matchesPreviousCur);
 
@@ -265,7 +323,7 @@ int main(int argc, char** argv) {
 			get3D2Dpoints(prev, cur, points3D, points2D);
 
 			std::cout << "points3D.size(): " << points3D.size() << "\n";
-			std::cout << "points2D.size(): " << points2D.size() << "\n";
+			std::cout << "points3D.size(): " << points3D.size() << "\n";
 
 			cv::Mat rvec(3,1,cv::DataType<float>::type);
 			cv::Mat tvec(3,1,cv::DataType<float>::type);
@@ -296,12 +354,19 @@ int main(int argc, char** argv) {
 			t_local = pnpDetection.get_t_matrix();
 			std::cout << "t_local: " << t_local << "\n";
 
+			cout<<"calling bundle adjustment"<<endl;
+
+            bundleAdjustment ( points3D, points2D, intrinsicParams, R_local, t_local );
+
 			R_local.copyTo(T(cv::Range(0, 3), cv::Range(0, 3)));
 			t_local.copyTo(T(cv::Range(0, 3), cv::Range(3, 4)));
 
+			std::cout << "prev.Tcw: " << prev.Tcw << "\n";
 			cur.T = prev.Tcw * T;
+			
 
-			setPose(T, cur);
+			setPose(cur.T, cur);
+			std::cout << "cur.Tcw: " << cur.Tcw << "\n";
 /*
 			R_local = R_local.t();
 			std::cout << "tvec: " << tvec;
@@ -326,8 +391,8 @@ int main(int argc, char** argv) {
 			//cur.PLeft = P;
 			//cur.PRight = cur.PLeft + intrinsicParamsRight;
 
-			int x = int(cur.tcw.at<float>(0)) + 300;
-			int y = int(cur.tcw.at<float>(2)) + 300;
+			float x = cur.tcw.at<float>(0) + 300.0;
+			float y = cur.tcw.at<float>(2) + 300.0;
 			cv::circle(traj, cv::Point(x, y), 1, CV_RGB(255, 0, 0), 2);
 			cv::rectangle(traj, cv::Point(10, 30), cv::Point(550, 50), CV_RGB(0, 0, 0), CV_FILLED);
 			std::cout << "x, y: " << x << " " << y << "\n";
@@ -417,6 +482,156 @@ void triangulateKeyPoints(const cv::Mat &ProjMatrixPrev, const cv::Mat &ProjMatr
 	cv::triangulatePoints(ProjMatrixPrev, ProjMatrixCur, pointsPrev, pointsPrev, points4D);
 }
 */
+
+cv::Point2d pixel2cam ( const cv::Point2d& p, const cv::Mat& K )
+{
+    return cv::Point2d
+           (
+               ( p.x - K.at<double> ( 0,2 ) ) / K.at<double> ( 0,0 ),
+               ( p.y - K.at<double> ( 1,2 ) ) / K.at<double> ( 1,1 )
+           );
+}
+
+void find_feature_matches ( const cv::Mat& img_1, const cv::Mat& img_2,
+                            std::vector<cv::KeyPoint>& keypoints_1,
+                            std::vector<cv::KeyPoint>& keypoints_2,
+                            std::vector<cv::DMatch>& matches )
+{
+    //-- 初始化
+    cv::Mat descriptors_1, descriptors_2;
+    // used in OpenCV3
+    cv::Ptr<cv::FeatureDetector> detector = cv::ORB::create();
+    cv::Ptr<cv::DescriptorExtractor> descriptor = cv::ORB::create();
+    // use this if you are in OpenCV2
+    // Ptr<FeatureDetector> detector = FeatureDetector::create ( "ORB" );
+    // Ptr<DescriptorExtractor> descriptor = DescriptorExtractor::create ( "ORB" );
+    cv::Ptr<cv::DescriptorMatcher> matcher  = cv::DescriptorMatcher::create ( "BruteForce-Hamming" );
+    //-- 第一步:检测 Oriented FAST 角点位置
+    detector->detect ( img_1,keypoints_1 );
+    detector->detect ( img_2,keypoints_2 );
+
+    //-- 第二步:根据角点位置计算 BRIEF 描述子
+    descriptor->compute ( img_1, keypoints_1, descriptors_1 );
+    descriptor->compute ( img_2, keypoints_2, descriptors_2 );
+
+    //-- 第三步:对两幅图像中的BRIEF描述子进行匹配，使用 Hamming 距离
+    std::vector<cv::DMatch> match;
+    // BFMatcher matcher ( NORM_HAMMING );
+    matcher->match ( descriptors_1, descriptors_2, match );
+
+    //-- 第四步:匹配点对筛选
+    double min_dist=10000, max_dist=0;
+
+    //找出所有匹配之间的最小距离和最大距离, 即是最相似的和最不相似的两组点之间的距离
+    for ( int i = 0; i < descriptors_1.rows; i++ )
+    {
+        double dist = match[i].distance;
+        if ( dist < min_dist ) min_dist = dist;
+        if ( dist > max_dist ) max_dist = dist;
+    }
+
+    printf ( "-- Max dist : %f \n", max_dist );
+    printf ( "-- Min dist : %f \n", min_dist );
+
+    //当描述子之间的距离大于两倍的最小距离时,即认为匹配有误.但有时候最小距离会非常小,设置一个经验值30作为下限.
+    for ( int i = 0; i < descriptors_1.rows; i++ )
+    {
+        if ( match[i].distance <= max ( 2*min_dist, 30.0 ) )
+        {
+            matches.push_back ( match[i] );
+        }
+    }
+}
+
+
+void bundleAdjustment (
+    const std::vector< cv::Point3f > points_3d,
+    const std::vector< cv::Point2f > points_2d,
+    const cv::Mat& K, cv::Mat& R, cv::Mat& t )
+{
+    // 初始化g2o
+    typedef g2o::BlockSolver< g2o::BlockSolverTraits<6,3> > Block;  // pose 维度为 6, landmark 维度为 3
+    Block::LinearSolverType* linearSolver = new g2o::LinearSolverCSparse<Block::PoseMatrixType>(); // 线性方程求解器
+    Block* solver_ptr = new Block ( linearSolver );     // 矩阵块求解器
+    g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg ( solver_ptr );
+    g2o::SparseOptimizer optimizer;
+    optimizer.setAlgorithm ( solver );
+
+    // vertex
+    g2o::VertexSE3Expmap* pose = new g2o::VertexSE3Expmap(); // camera pose
+    Eigen::Matrix3d R_mat;
+    R_mat <<
+          R.at<double> ( 0,0 ), R.at<double> ( 0,1 ), R.at<double> ( 0,2 ),
+               R.at<double> ( 1,0 ), R.at<double> ( 1,1 ), R.at<double> ( 1,2 ),
+               R.at<double> ( 2,0 ), R.at<double> ( 2,1 ), R.at<double> ( 2,2 );
+    pose->setId ( 0 );
+    pose->setEstimate ( g2o::SE3Quat (
+                            R_mat,
+                            Eigen::Vector3d ( t.at<double> ( 0,0 ), t.at<double> ( 1,0 ), t.at<double> ( 2,0 ) )
+                        ) );
+    optimizer.addVertex ( pose );
+
+    int index = 1;
+    for ( const cv::Point3f p:points_3d )   // landmarks
+    {
+        g2o::VertexSBAPointXYZ* point = new g2o::VertexSBAPointXYZ();
+        point->setId ( index++ );
+        point->setEstimate ( Eigen::Vector3d ( p.x, p.y, p.z ) );
+        point->setMarginalized ( true ); // g2o 中必须设置 marg 参见第十讲内容
+        optimizer.addVertex ( point );
+    }
+
+    // parameter: camera intrinsics
+    g2o::CameraParameters* camera = new g2o::CameraParameters (
+        K.at<double> ( 0,0 ), Eigen::Vector2d ( K.at<double> ( 0,2 ), K.at<double> ( 1,2 ) ), 0
+    );
+    camera->setId ( 0 );
+    optimizer.addParameter ( camera );
+
+    // edges
+    index = 1;
+    for ( const cv::Point2f p:points_2d )
+    {
+        g2o::EdgeProjectXYZ2UV* edge = new g2o::EdgeProjectXYZ2UV();
+        edge->setId ( index );
+        edge->setVertex ( 0, dynamic_cast<g2o::VertexSBAPointXYZ*> ( optimizer.vertex ( index ) ) );
+        edge->setVertex ( 1, pose );
+        edge->setMeasurement ( Eigen::Vector2d ( p.x, p.y ) );
+        edge->setParameterId ( 0,0 );
+        edge->setInformation ( Eigen::Matrix2d::Identity() );
+        optimizer.addEdge ( edge );
+        index++;
+    }
+
+    chrono::steady_clock::time_point t1 = chrono::steady_clock::now();
+    optimizer.setVerbose ( false );
+    optimizer.initializeOptimization();
+    optimizer.optimize ( 100 );
+    chrono::steady_clock::time_point t2 = chrono::steady_clock::now();
+    chrono::duration<double> time_used = chrono::duration_cast<chrono::duration<double>> ( t2-t1 );
+    cout<<"optimization costs time: "<<time_used.count() <<" seconds."<<endl;
+
+    cout<<endl<<"after optimization:"<<endl;
+    cout<<"T="<<endl<<Eigen::Isometry3d ( pose->estimate() ).matrix() <<endl;
+    cv::Mat T = toCvMat(Eigen::Isometry3d ( pose->estimate() ).matrix());
+
+    T(cv::Range(0, 3), cv::Range(0, 3)).copyTo(R);
+    T(cv::Range(0, 3), cv::Range(3, 4)).copyTo(t);
+
+    			//R_local.copyTo(T(cv::Range(0, 3), cv::Range(0, 3)));
+			//t_local.copyTo(T(cv::Range(0, 3), cv::Range(3, 4)));
+}
+
+cv::Mat toCvMat(const Eigen::Matrix<double,4,4> &m)
+{
+    cv::Mat cvMat(4,4,CV_32F);
+    for(int i=0;i<4;i++)
+        for(int j=0; j<4; j++)
+            cvMat.at<float>(i,j)=m(i,j);
+
+    return cvMat.clone();
+}
+
 void setPose(cv::Mat T, ImagePose &ip)
 {
 	ip.Tcw = T.clone();
@@ -455,7 +670,7 @@ void UnprojectStereo(ImagePose &cur, std::vector<cv::Point2f> &pointsLeft, std::
         	const float x = (u - camPms.cx) * z * camPms.invfx;
         	const float y = (v - camPms.cy) * z * camPms.invfy;
         	cv::Mat x3Dc = (cv::Mat_<float>(3,1) << x, y, z);
-        	x3Dc = cur.Rwc * x3Dc + cur.Ow;
+        	//x3Dc = cur.Rwc * x3Dc + cur.Ow;
         	cv::Point3f x3D;
         	x3D.x = x3Dc.at<float>(0, 0);
         	x3D.y = x3Dc.at<float>(1, 0);
@@ -866,9 +1081,9 @@ void ComputeDepthMap(const cv::Mat &imLeft, const cv::Mat &imRight, cv::Mat &fil
 
 void LoadImages(const std::string &imgPath, std::vector<std::string> &imgsLeft, std::vector<std::string> &imgsRight)
 {
-	std::string timesPath = imgPath + "/times.txt";
-	std::string imgsLeftPath = imgPath + "/image_0/";
-	std::string imgsRightPath = imgPath + "/image_1/";
+	std::string timesPath = imgPath + "/timestamps.txt";
+	std::string imgsLeftPath = imgPath + "/image_00/data/";
+	std::string imgsRightPath = imgPath + "/image_01/data/";
 	std::ifstream inTimes;
 	std::string time;
 	std::vector<std::string> times;
@@ -889,10 +1104,11 @@ void LoadImages(const std::string &imgPath, std::vector<std::string> &imgsLeft, 
 	for(size_t i = 0; i < times.size(); i++)
 	{
 		std::stringstream ss;
-		ss << std::setfill('0') << std::setw(6) << i;
+		ss << std::setfill('0') << std::setw(10) << i;
 
 		imgsLeft[i] = imgsLeftPath + ss.str() + ".png";
 		imgsRight[i] = imgsRightPath + ss.str() + ".png";
+		//std::cout << imgsLeft[i] << "\n";
 
 	}
 }
