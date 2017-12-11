@@ -175,9 +175,9 @@ int main(int argc, char** argv) {
 	camPms.cy = 183.1104;
 	camPms.invfx = 1.0f / camPms.fx;
 	camPms.invfy = 1.0f / camPms.fy;
-	camPms.mbf = 379,8145;
+	camPms.mbf = 379.8145;
 	camPms.mb = camPms.mbf / camPms.fx;
-	camPms.mThDepth = camPms.mbf * 45.0f / camPms.fx;
+	camPms.mThDepth = camPms.mbf * 35.0f / camPms.fx;
 
 	cout << endl << "Depth Threshold (Close/Far Points): " << camPms.mThDepth << std::endl;
 
@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
 	double confidence = 0.95;
 
 	// Robust Matcher parameters
-	int numKeyPoints = 2000;
+	int numKeyPoints = 4000;
 	float ratioTest = 0.70f;
 	RobustMatcher rmacher;
 
@@ -915,7 +915,16 @@ void DetectFeatures(const cv::Mat &imLeft, const cv::Mat &imRight,
 					std::vector<cv::KeyPoint> &keyPointsLeft, std::vector<cv::KeyPoint> &keyPointsRight)
 {
 	int minHessian = 400;
-	cv::Ptr<cv::xfeatures2d::SURF> detector = cv::xfeatures2d::SURF::create(minHessian);
+	//cv::Ptr<cv::xfeatures2d::SURF> detector = cv::xfeatures2d::SURF::create(minHessian);
+
+	// good features to detect
+	int corner_count = 4000;
+	double quality_level = 0.01;
+	double min_distance = 1;
+    cv::Ptr<cv::GFTTDetector> detector = cv::GFTTDetector::create(
+            corner_count,
+            quality_level,
+            min_distance);
 
 	detector->detect(imLeft, keyPointsLeft);
 	detector->detect(imRight, keyPointsRight);
@@ -936,13 +945,26 @@ void MakeDescriptors(const cv::Mat &imLeft, const cv::Mat &imRight,
 					 cv::Mat &descriptorsLeft, cv::Mat &descriptorsRight)
 {
 	int minHessian = 400;
-	cv::Ptr<cv::xfeatures2d::SURF> descriptor = cv::xfeatures2d::SURF::create(minHessian);
+	//cv::Ptr<cv::xfeatures2d::SURF> descriptor = cv::xfeatures2d::SURF::create(minHessian);
+	//1 FREAK feature descriptor
+    cv::Ptr<cv::xfeatures2d::FREAK> descriptor = cv::xfeatures2d::FREAK::create(
+            false, // orientation normalization
+            false // scale normalization
+            );
 
 	descriptor->compute(imLeft, keyPointsLeft, descriptorsLeft);
 	std::cout << "keyPointsLeft.size: " << keyPointsLeft.size() << "\n";
 	cv::Mat descT = descriptorsLeft.t();
 	std::cout << "descriptorsLeft.size: " << descriptorsLeft.size() << "\n";
 	descriptor->compute(imRight, keyPointsRight, descriptorsRight);
+
+	if(descriptorsLeft.type()!=CV_32F) {
+    descriptorsLeft.convertTo(descriptorsLeft, CV_32F);
+	}
+
+    if(descriptorsRight.type()!=CV_32F) {
+    descriptorsRight.convertTo(descriptorsRight, CV_32F);
+	}
 
 }
 
